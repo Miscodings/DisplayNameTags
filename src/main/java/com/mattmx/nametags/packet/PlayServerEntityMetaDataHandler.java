@@ -7,6 +7,7 @@ import com.github.retrooper.packetevents.manager.server.VersionComparison;
 import com.github.retrooper.packetevents.protocol.entity.data.EntityData;
 import com.github.retrooper.packetevents.protocol.entity.data.EntityDataTypes;
 import com.github.retrooper.packetevents.protocol.player.ClientVersion;
+import com.github.retrooper.packetevents.protocol.player.User;
 import com.github.retrooper.packetevents.util.Vector3f;
 import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerEntityMetadata;
 import com.mattmx.nametags.NameTags;
@@ -18,6 +19,8 @@ import net.kyori.adventure.text.TextComponent;
 import org.bukkit.entity.Player;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
+
+import java.util.ArrayList;
 
 /**
  * Responsible for two things:
@@ -32,6 +35,9 @@ import org.jetbrains.annotations.Nullable;
  * <p>
  * 2. Apply relational placeholders (off the netty thread) if there are
  * any.
+ * <p>
+ * The entry list is copied so we never mutate a list shared with another
+ * listener's wrapper.
  */
 public class PlayServerEntityMetaDataHandler {
     private static final byte TEXT_DISPLAY_TEXT_INDEX = 23;
@@ -51,24 +57,28 @@ public class PlayServerEntityMetaDataHandler {
     public static void handlePacket(@NotNull PacketSendEvent event) {
         final NameTags plugin = NameTags.getInstance();
 
-        final PacketSendEvent eventClone = event.clone();
-        final WrapperPlayServerEntityMetadata packet0 = new WrapperPlayServerEntityMetadata(event);
+        // Decode once and look up before doing anything else, so packets for
+        // non-nametag entities (the vast majority) cost only a map lookup.
+        final WrapperPlayServerEntityMetadata original = new WrapperPlayServerEntityMetadata(event);
 
-        final NameTagEntity nameTagEntity = plugin.getEntityManager().getNameTagEntityByTagEntityId(packet0.getEntityId());
+        final NameTagEntity nameTagEntity = plugin.getEntityManager().getNameTagEntityByTagEntityId(original.getEntityId());
 
-        if (nameTagEntity == null) {
-            eventClone.cleanUp();
-            return;
-        }
+        if (nameTagEntity == null) return;
 
         event.setCancelled(true);
-        final WrapperPlayServerEntityMetadata packet = new WrapperPlayServerEntityMetadata(eventClone);
+
+        // The decoded entries no longer depend on the event buffer, so we can
+        // build a fresh packet from them instead of cloning the event.
+        final User user = event.getUser();
+        final Player to = event.getPlayer();
+        final WrapperPlayServerEntityMetadata packet = new WrapperPlayServerEntityMetadata(
+            original.getEntityId(),
+            new ArrayList<>(original.getEntityMetadata())
+        );
 
         // This could prove a concurrency issue, maybe we should keep track of if there is a newer packet processing?
         plugin.getExecutor().execute(() -> {
-            boolean isOldClient = eventClone.getUser()
-                .getClientVersion()
-                .isOlderThan(ClientVersion.V_1_20_2);
+            boolean isOldClient = user.getClientVersion().isOlderThan(ClientVersion.V_1_20_2);
 
             boolean containsEntityOffset = false;
             @Nullable EntityData textEntry = null;
@@ -92,37 +102,28 @@ public class PlayServerEntityMetaDataHandler {
             // Backwards compatibility for clients older than 1.20.2
             // Mojank changed the passenger origin point when riding an entity so the tag appears inside their head.
             if (isOldClient && !containsEntityOffset) {
-                // If there was no offset found then add one ourselves for the offset.
+                // Partial (delta) packets may not include the translation, so use the
+                // tag's current translation rather than overwriting it with just the offset.
+                Vector3f current = nameTagEntity.getMeta().getTranslation();
                 packet.getEntityMetadata().add(new EntityData(
                     ENTITY_OFFSET_INDEX,
                     EntityDataTypes.VECTOR3F,
-                    PRE_1_20_2_TRANSLATION_OFFSET
+                    (current == null ? Vector3f.zero() : current).add(PRE_1_20_2_TRANSLATION_OFFSET)
                 ));
             }
 
             // Apply relational placeholders to the text of an outgoing display entity
-            if (plugin.getConfig().getBoolean("options.relative-placeholders-support") &&
+            if (textEntry != null &&
+                to != null &&
                 nameTagEntity.getBukkitEntity() instanceof Player from &&
-                textEntry != null
+                plugin.getConfig().getBoolean("options.relative-placeholders-support") &&
+                textEntry.getValue() instanceof TextComponent originalText &&
+                ComponentUtils.contains(originalText, RELATIVE_ARG_PREFIX)
             ) {
-                final TextComponent originalText = (TextComponent) textEntry.getValue();
-                final Player to = eventClone.getPlayer();
-
-                boolean containsRelativePlaceholder = ComponentUtils.contains(originalText, RELATIVE_ARG_PREFIX);
-
-                // If it doesn't have any placeholders in then stop
-                if (!containsRelativePlaceholder) {
-                    eventClone.getUser().sendPacketSilently(packet);
-                    return;
-                }
-
-                final Component textWithRelativeApplied = PapiHook.setRelationalPlaceholders(from, to, originalText);
-
-                textEntry.setValue(textWithRelativeApplied);
-                eventClone.getUser().sendPacketSilently(packet);
-            } else {
-                eventClone.getUser().sendPacketSilently(packet);
+                textEntry.setValue(PapiHook.setRelationalPlaceholders(from, to, originalText));
             }
+
+            user.sendPacketSilently(packet);
         });
     }
 

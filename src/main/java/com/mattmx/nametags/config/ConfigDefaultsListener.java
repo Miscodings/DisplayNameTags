@@ -5,14 +5,13 @@ import com.mattmx.nametags.entity.NameTagEntity;
 import com.mattmx.nametags.entity.trait.RefreshTrait;
 import com.mattmx.nametags.entity.trait.SneakTrait;
 import com.mattmx.nametags.event.NameTagEntityCreateEvent;
-import me.tofaa.entitylib.meta.display.AbstractDisplayMeta;
 import org.bukkit.configuration.ConfigurationSection;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 
-import java.util.List;
 import java.util.Map;
 
 public class ConfigDefaultsListener implements Listener {
@@ -29,6 +28,35 @@ public class ConfigDefaultsListener implements Listener {
                 meta.setPositionRotationInterpolationDuration(5);
                 TextDisplayMetaConfiguration.applyMeta(defaultSection(), meta);
             }));
+    }
+
+    /**
+     * Caches the player's highest-priority group so we don't check every
+     * group permission and sort on every refresh. Re-checked every
+     * {@code options.group-check-interval} ms (default 5000).
+     */
+    private final class GroupCache {
+        private final @NotNull Player player;
+        private @Nullable Map.Entry<String, ConfigurationSection> highest = null;
+        private long nextCheck = 0L;
+
+        private GroupCache(@NotNull Player player) {
+            this.player = player;
+        }
+
+        private @Nullable Map.Entry<String, ConfigurationSection> get() {
+            long now = System.currentTimeMillis();
+            if (now < nextCheck) return highest;
+
+            highest = plugin.getGroups()
+                .entrySet()
+                .stream()
+                .filter((e) -> player.hasPermission(e.getKey()))
+                .reduce((a, b) -> GroupPriorityComparator.get().compare(a, b) > 0 ? a : b)
+                .orElse(null);
+            nextCheck = now + plugin.getConfig().getLong("options.group-check-interval", 5000L);
+            return highest;
+        }
     }
 
     private ConfigurationSection defaultSection() {
@@ -56,6 +84,7 @@ public class ConfigDefaultsListener implements Listener {
 
     public void registerDefaultRefreshListener(@NotNull NameTagEntity tag, long refreshMillis) {
         Player player = (Player) tag.getBukkitEntity();
+        GroupCache groupCache = new GroupCache(player);
 
         tag.getTraits().getOrAddTrait(RefreshTrait.class, () ->
             RefreshTrait.ofMillis(
@@ -65,17 +94,10 @@ public class ConfigDefaultsListener implements Listener {
                     TextDisplayMetaConfiguration.applyMeta(defaultSection(), entity.getMeta());
                     TextDisplayMetaConfiguration.applyTextMeta(defaultSection(), entity.getMeta(), player);
 
-                    // TODO we should cache this stuff
-                    List<Map.Entry<String, ConfigurationSection>> groups = plugin.getGroups()
-                        .entrySet()
-                        .stream()
-                        .filter((e) -> player.hasPermission(e.getKey()))
-                        .sorted(GroupPriorityComparator.get())
-                        .toList();
+                    Map.Entry<String, ConfigurationSection> highest = groupCache.get();
 
                     long recentRefreshEvery = plugin.getConfig().getLong("defaults.refresh-every", 50);
-                    if (!groups.isEmpty()) {
-                        Map.Entry<String, ConfigurationSection> highest = groups.getLast();
+                    if (highest != null) {
 
                         TextDisplayMetaConfiguration.applyMeta(highest.getValue(), entity.getMeta());
                         TextDisplayMetaConfiguration.applyTextMeta(highest.getValue(), entity.getMeta(), player);
@@ -91,10 +113,9 @@ public class ConfigDefaultsListener implements Listener {
                         registerDefaultRefreshListener(tag, recentRefreshEvery);
                     }
 
-                    if (entity.getMeta().getBillboardConstraints() == AbstractDisplayMeta.BillboardConstraints.CENTER) {
-                        // Look passenger down to remove debug getting in the way
-                        entity.getPassenger().rotateHead(0f, 90f);
-                    }
+                    // Look passenger down to remove debug getting in the way.
+                    // Only sends packets if the billboard changed since last time.
+                    entity.ensureRotation();
 
                     // Preserve background color for sneaking
                     // Maybe we should introduce an `afterRefresh` callback?
@@ -103,7 +124,8 @@ public class ConfigDefaultsListener implements Listener {
                         .ifPresent(SneakTrait::manuallyUpdateSneakingOpacity);
 
                     entity.updateVisibility();
-                    entity.getPassenger().refresh();
+                    // Only send metadata entries that actually changed.
+                    entity.flushMetaChanges();
                 }
             )
         );

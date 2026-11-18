@@ -1,6 +1,9 @@
 options:
   threads: 2
   relative-placeholders-support: true
+  # How often (in milliseconds) to re-check a player's group permissions.
+  # Group changes take up to this long to show on the tag.
+  group-check-interval: 5000
 
 # Base default options applied first
 defaults:

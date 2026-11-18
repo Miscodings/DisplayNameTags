@@ -36,7 +36,7 @@ public class SneakTrait extends Trait {
                 meta.setTextOpacity(previousTextOpacity);
             }
         });
-        getTag().getPassenger().refresh();
+        getTag().flushMetaChanges();
     }
 
     public Color withCustomSneakOpacity(@NotNull Color previous) {
